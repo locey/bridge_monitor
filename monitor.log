@@ -1,0 +1,20 @@
+2024-07-24 20:21:08 - Starting service monitor
+2024-07-24 20:21:08 - MongoDB is already running
+2024-07-24 20:21:08 - Main program is already running
+2024-07-24 20:29:16 - Starting service monitor
+2024-07-24 20:29:16 - Starting MongoDB
+2024-07-24 20:29:18 - Failed to start MongoDB
+2024-07-24 20:29:20 - Starting main program
+2024-07-24 20:29:22 - Failed to start main program
+2024-07-24 20:29:22 - MongoDB is not running, restarting...
+2024-07-24 20:29:22 - Starting MongoDB
+2024-07-24 20:29:24 - Failed to start MongoDB
+2024-07-24 20:29:24 - Mongo Express is not running, restarting...
+2024-07-24 20:29:26 - Main program is not running, restarting...
+2024-07-24 20:29:26 - Starting main program
+2024-07-24 20:29:28 - Failed to start main program
+2024-07-24 20:54:57 - Starting service monitor
+2024-07-24 20:54:57 - Starting MongoDB
+2024-07-24 20:54:59 - MongoDB started successfully
+2024-07-24 20:55:01 - Starting main program
+2024-07-24 20:55:03 - Main program started successfully
