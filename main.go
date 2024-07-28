@@ -4,48 +4,55 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"math/big"
 	"os"
+	"path/filepath"
 	"strings"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/sirupsen/logrus"
 
-	"go.mongodb.org/mongo-driver/mongo"
-	"meson-monitor/database"
 	"meson-monitor/bot"
+	"meson-monitor/database"
+
 )
 
 type Config struct {
 	Main struct {
-		WalletAddress string `json:"walletAddress"`
-		PrivateKey    string `json:"privateKey"`
-		CheckTime     int    `json:"check_time"`
-		BotToken      string `json:"botToken"`
-		ChatID        int64  `json:"chatID"`
-		LarkBotURL    string `json:"lark_bot"`
-		PostgresURI   string `json:"postgresURI"`
+		WalletAddress string   `json:"walletAddress"`
+		PrivateKey    string   `json:"privateKey"`
+		CheckTime     int      `json:"check_time"`
+		BotToken      string   `json:"botToken"`
+		ChatIDs       []int64  `json:"chatIDs"`
+		LarkBotURL    string   `json:"lark_bot"`
+		PostgresURI   string   `json:"postgresURI"`
 	} `json:"main"`
 	Chains map[string]struct {
 		RpcUrl        string `json:"rpcUrl"`
 		MesonContract string `json:"mesonContract"`
 		MesonIndex    uint8  `json:"mesonIndex"`
 		TokenDecimal  uint8  `json:"tokendecimal"`
+		StartBlock    uint64 `json:"startBlock"`
 		TokenContract string `json:"tokenContract"`
 	} `json:"chains"`
 }
 
-
 var (
 	telegramBot *bot.TelegramBot // 全局 TelegramBot 实例
-	larkBot     *bot.LarkBot    // 全局 LarkBot 实例
+	larkBot     *bot.LarkBot     // 全局 LarkBot 实例
 	contractABI = `[{"anonymous":false,"inputs":[{"indexed":true,"name":"reqId","type":"bytes32"},{"indexed":true,"name":"recipient","type":"address"}],"name":"TokenMintExecuted","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"name":"reqId","type":"bytes32"},{"indexed":true,"name":"proposer","type":"address"}],"name":"TokenBurnExecuted","type":"event"}]`
+)
+
+const (
+	lastBlockDir = "last_block"
+	blockStep    = 5000
 )
 
 // loadConfig 读取并解析配置文件
@@ -74,37 +81,79 @@ func loadConfig(filename string) (*Config, error) {
 	return &config, nil
 }
 
-
 // meson_event 验证 Meson 事件
 func meson_event(actionA, actionB string) bool {
 	return (actionA == "TokenBurnExecuted" && actionB == "TokenMintExecuted") ||
 		(actionA == "TokenMintExecuted" && actionB == "TokenBurnExecuted")
 }
 
+// 格式化数字为千分位
+func formatWithCommas(number float64) string {
+	return addCommas(strconv.FormatInt(int64(number), 10))
+}
 
-func sendNotification(messageType, message string) {
-	if messageType == "Error" {
-		message = "Error: " + message
-	} else if messageType == "Information" {
-		message = "Information: " + message
+// 添加逗号作为千分位分隔符
+func addCommas(numStr string) string {
+	n := len(numStr)
+	if n <= 3 {
+		return numStr
+	}
+	rem := n % 3
+	if rem > 0 {
+		return numStr[:rem] + "," + addCommas(numStr[rem:])
+	}
+	return numStr[:3] + "," + addCommas(numStr[3:])
+}
+
+// 构建消息的函数
+func constructMessage(timestamp int64, chainA, actionA string, amountA float64, txHashA string, chainB, actionB string, amountB float64, txHashB string) {
+	var fromChain, toChain, fromAction, toAction string
+	var fromAmount, toAmount float64
+	var fromTxHash, toTxHash string
+
+	if actionA == "TokenBurnExecuted" {
+		fromChain, fromAction, fromAmount, fromTxHash = chainA, "Burn", amountA, txHashA
+		toChain, toAction, toAmount, toTxHash = chainB, "Mint", amountB, txHashB
+	} else {
+		fromChain, fromAction, fromAmount, fromTxHash = chainB, "Burn", amountB, txHashB
+		toChain, toAction, toAmount, toTxHash = chainA, "Mint", amountA, txHashA
 	}
 
-	telegramErr := telegramBot.SendMessage(message, "HTML")
+	telegramMessage := fmt.Sprintf(
+		"<b>*****❗️❗️Bridge data anomaly❗️❗️*****</b>\n<b>Time:</b> %s\n\n<b>From:</b> %s <b>%s</b> [%s]\n<b>To:</b> %s <b>%s</b> [%s]\n\n<b>Tx hash (From):</b> %s\n<b>Tx hash (To):</b> %s\n",
+		time.Unix(timestamp, 0).UTC().Format(time.RFC3339),
+		fromChain, fromAction, formatWithCommas(fromAmount),
+		toChain, toAction, formatWithCommas(toAmount),
+		fromTxHash,
+		toTxHash,
+	)
+
+	larkTitle := "*****❗️❗️Bridge data anomaly❗️❗️*****"
+	larkTime := time.Unix(timestamp, 0).UTC().Format(time.RFC3339)
+	larkFrom := fmt.Sprintf("%s **%s** [%s]", fromChain, fromAction, formatWithCommas(fromAmount))
+	larkTo := fmt.Sprintf("%s **%s** [%s]", toChain, toAction, formatWithCommas(toAmount))
+	larkTxHashFrom := fromTxHash
+	larkTxHashTo := toTxHash
+
+	// 发送消息到 Telegram
+	telegramErr := telegramBot.SendMessage(telegramMessage, "HTML")
 	if telegramErr != nil {
 		logrus.Errorf("Failed to send Telegram message: %v", telegramErr)
 	}
 
-	larkErr := larkBot.SendMessage(message)
+	// 发送消息到 Lark
+	larkErr := larkBot.SendMessage(larkTitle, larkTime, larkFrom, larkTo, larkTxHashFrom, larkTxHashTo)
 	if larkErr != nil {
 		logrus.Errorf("Failed to send Lark message: %v", larkErr)
 	}
 }
 
 
+
 func meson_handle(reqID, chainName, eventName string, createdTime int64, amount float64, txHash string) error {
 	// 查询数据库中是否已存在该 reqID 的文档
 	existingMeson, err := database.FindMesonByReqID(reqID)
-	if err != nil && err != mongo.ErrNoDocuments {
+	if err != nil{
 		// 如果查询过程中出现错误（且不是没有文档错误），记录错误并返回
 		logrus.Errorf("Failed to query Meson by ReqID: %v", err)
 		return fmt.Errorf("failed to query Meson by ReqID: %v", err)
@@ -113,12 +162,14 @@ func meson_handle(reqID, chainName, eventName string, createdTime int64, amount 
 	if existingMeson != nil {
 		if existingMeson.ChainB != "" {
 			// 构建错误消息
-			message := fmt.Sprintf(
-				"\nMeson same reqId: ChainB already has a value\nReqID: %s\nChainA: %s\nChainB: %s\nTimestamp: %d\nAmountA: %f\nAmountB: %f\nActionA: %s\nActionB: %s\nTxHashA: %s\nTxHashB: %s\nIsCheck: %t\n",
-				existingMeson.ReqID, existingMeson.ChainA, existingMeson.ChainB, existingMeson.Timestamp, existingMeson.AmountA, existingMeson.AmountB, existingMeson.ActionA, existingMeson.ActionB, existingMeson.TxHashA, existingMeson.TxHashB, existingMeson.IsCheck)
+			constructMessage (
+				existingMeson.Timestamp,
+				existingMeson.ChainA, existingMeson.ActionA, existingMeson.AmountA, existingMeson.TxHashA,
+				existingMeson.ChainB, existingMeson.ActionB, existingMeson.AmountB, existingMeson.TxHashB,
+			)
 
 			// 发送错误消息
-			sendNotification("Error", message)
+			//sendNotification("Error", message)
 
 			logrus.Errorf("ChainB already has a value for ReqID: %s", reqID)
 			return fmt.Errorf("error: ChainB already has a value")
@@ -140,12 +191,14 @@ func meson_handle(reqID, chainName, eventName string, createdTime int64, amount 
 			// 验证动作，必须是一个 burn，另一个是 mint
 			if !meson_event(existingMeson.ActionA, existingMeson.ActionB) {
 				// 构建错误消息
-				message := fmt.Sprintf(
-					"\nMeson same event!\nReqID: %s\nChainA: %s\nChainB: %s\nTimestamp: %d\nAmountA: %f\nAmountB: %f\nActionA: %s\nActionB: %s\nTxHashA: %s\nTxHashB: %s\nIsCheck: %t\n",
-					existingMeson.ReqID, existingMeson.ChainA, existingMeson.ChainB, existingMeson.Timestamp, existingMeson.AmountA, existingMeson.AmountB, existingMeson.ActionA, existingMeson.ActionB, existingMeson.TxHashA, existingMeson.TxHashB, existingMeson.IsCheck)
+				constructMessage(
+					existingMeson.Timestamp,
+					existingMeson.ChainA, existingMeson.ActionA, existingMeson.AmountA, existingMeson.TxHashA,
+					existingMeson.ChainB, existingMeson.ActionB, existingMeson.AmountB, existingMeson.TxHashB,
+				)
 
 				// 发送错误消息
-				sendNotification("Error", message)
+				//sendNotification("Error", message)
 
 				logrus.Errorf("Meson event validation failed for ReqID: %s", reqID)
 				return fmt.Errorf("error: meson event validation failed: actionA and actionB must be one TokenBurnExecuted and one TokenMintExecuted")
@@ -153,26 +206,24 @@ func meson_handle(reqID, chainName, eventName string, createdTime int64, amount 
 
 			// 验证数额，必须两个数额是一样的
 			if !existingMeson.IsCheck {
-				message := fmt.Sprintf(
-					"\nAmounts do not match!\nReqID: %s\nChainA: %s\nChainB: %s\nTimestamp: %d\nAmountA: %f\nAmountB: %f\nActionA: %s\nActionB: %s\nTxHashA: %s\nTxHashB: %s\nIsCheck: %t\n",
-					existingMeson.ReqID, existingMeson.ChainA, existingMeson.ChainB, existingMeson.Timestamp, existingMeson.AmountA, existingMeson.AmountB, existingMeson.ActionA, existingMeson.ActionB, existingMeson.TxHashA, existingMeson.TxHashB, existingMeson.IsCheck)
+				constructMessage(
+					existingMeson.Timestamp,
+					existingMeson.ChainA, existingMeson.ActionA, existingMeson.AmountA, existingMeson.TxHashA,
+					existingMeson.ChainB, existingMeson.ActionB, existingMeson.AmountB, existingMeson.TxHashB,
+				)
 
 				// 发送错误消息
-				sendNotification("Error", message)
+				//sendNotification("Error", message)
 
 				logrus.Errorf("Amounts do not match for ReqID: %s", reqID)
 				return fmt.Errorf("error: Amounts do not match.")
 			}
 
-			// 构建成功消息
-			message := fmt.Sprintf(
-				"\nCross-chain success!\nReqID: %s\nChainA: %s\nChainB: %s\nTimestamp: %d\nAmountA: %f\nAmountB: %f\nActionA: %s\nActionB: %s\nTxHashA: %s\nTxHashB: %s\nIsCheck: %t\n",
-				existingMeson.ReqID, existingMeson.ChainA, existingMeson.ChainB, existingMeson.Timestamp, existingMeson.AmountA, existingMeson.AmountB, existingMeson.ActionA, existingMeson.ActionB, existingMeson.TxHashA, existingMeson.TxHashB, existingMeson.IsCheck)
-
-			// 发送信息消息
-			sendNotification("Information", message)
-
-			logrus.Info("Amounts match for ReqID: ", reqID)
+			// 成功消息通过日志打印，不发送通知
+			logrus.Infof(
+				"Cross-chain success!\nReqID: %s\nChainA: %s\nChainB: %s\nTimestamp: %d\nAmountA: %f\nAmountB: %f\nActionA: %s\nActionB: %s\nTxHashA: %s\nTxHashB: %s\nIsCheck: %t\n",
+				existingMeson.ReqID, existingMeson.ChainA, existingMeson.ChainB, existingMeson.Timestamp, existingMeson.AmountA, existingMeson.AmountB, existingMeson.ActionA, existingMeson.ActionB, existingMeson.TxHashA, existingMeson.TxHashB, existingMeson.IsCheck,
+			)
 		}
 	} else {
 		// 如果文档不存在，插入新文档
@@ -196,8 +247,6 @@ func meson_handle(reqID, chainName, eventName string, createdTime int64, amount 
 
 	return nil
 }
-
-
 
 // processEvent 处理事件的公共逻辑
 // 该函数接受链名称、事件名称、请求 ID、地址、Meson 索引和代币小数位数作为参数
@@ -237,10 +286,9 @@ func processEvent(chainName, eventName string, reqID common.Hash, address common
 	}
 }
 
-
 // listenEvents 启动一个无限循环监听指定链上的事件
 // 该函数接受一个 WaitGroup 指针、链名称、RPC URL、合约地址、Meson 索引和代币小数位数作为参数
-func listenEvents(wg *sync.WaitGroup, chainName, rpcUrl, tokenContract string, mesonIndex uint8, tokenDecimal uint8) {
+func listenEvents(wg *sync.WaitGroup, chainName, rpcUrl, tokenContract string, mesonIndex uint8, tokenDecimal uint8, startBlock uint64) {
 	defer wg.Done() // 在函数结束时调用 Done 方法以通知 WaitGroup 当前协程已完成
 
 	for {
@@ -248,11 +296,13 @@ func listenEvents(wg *sync.WaitGroup, chainName, rpcUrl, tokenContract string, m
 		ctx, cancel := context.WithCancel(context.Background())
 
 		// 连接到以太坊客户端并监听事件
-		err := connectAndListen(ctx, chainName, rpcUrl, tokenContract, mesonIndex, tokenDecimal)
+		err := connectAndListen(ctx, chainName, rpcUrl, tokenContract, mesonIndex, tokenDecimal, startBlock)
 		if err != nil {
-			// 如果连接或监听过程中出现错误，输出错误信息并在 5 秒后重试
-			logrus.Errorf("Error in connectAndListen: %v. Retrying in 5 seconds...\n", err)
-			time.Sleep(5 * time.Second)
+			logrus.WithFields(logrus.Fields{
+				"ChainName": chainName,
+				"Error":     err,
+			}).Error("Error in connectAndListen. Retrying in 30 seconds...\n")
+			time.Sleep(30 * time.Second)
 		}
 
 		// 确保在每次重试之前取消先前的上下文
@@ -260,82 +310,151 @@ func listenEvents(wg *sync.WaitGroup, chainName, rpcUrl, tokenContract string, m
 	}
 }
 
+// getLatestBlockNumber 获取当前链的最新区块号
+func getLatestBlockNumber(client *ethclient.Client) (uint64, error) {
+	header, err := client.HeaderByNumber(context.Background(), nil)
+	if err != nil {
+		logrus.Errorf("Failed to get latest block header: %v", err)
+		return 0, err
+	}
+	logrus.Infof("Latest block number: %d", header.Number.Uint64())
+	return header.Number.Uint64(), nil
+}
+
+
+func getLastBlockNumber(chainName string, client *ethclient.Client, contractAddress common.Address, startBlock uint64) (uint64, error) {
+	filename := filepath.Join("last_block", chainName+".txt")
+	if _, err := os.Stat(filename); os.IsNotExist(err) {
+		logrus.Infof("Using startBlock from config for chain: %s", chainName)
+		return startBlock, nil // 从配置文件中的起始区块号开始
+	}
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		logrus.Errorf("Failed to read last block file: %v", err)
+		return 0, err
+	}
+	var blockNumber uint64
+	err = json.Unmarshal(data, &blockNumber)
+	if err != nil {
+		logrus.Errorf("Failed to unmarshal last block number: %v", err)
+		return 0, err
+	}
+	logrus.Infof("Last block number for chain %s: %d", chainName, blockNumber)
+	return blockNumber, nil
+}
+
+
+
+func saveLastBlockNumber(chainName string, blockNumber uint64) error {
+	filename := filepath.Join("last_block", chainName+".txt")
+	data, err := json.Marshal(blockNumber)
+	if err != nil {
+		logrus.Errorf("Failed to marshal block number: %v", err)
+		return err
+	}
+	err = ioutil.WriteFile(filename, data, 0644)
+	if err != nil {
+		logrus.Errorf("Failed to write last block number to file: %v", err)
+	}
+	logrus.Infof("Saved last block number %d for chain %s to file: %s", blockNumber, chainName, filename)
+	return err
+}
+
 
 // connectAndListen 连接到以太坊客户端并监听指定合约的事件
 // 该函数接受上下文、链名称、RPC URL、合约地址、Meson 索引和代币小数位数作为参数
 // 返回一个错误值
-func connectAndListen(ctx context.Context, chainName, rpcUrl, tokenContract string, mesonIndex uint8, tokenDecimal uint8) error {
-	// 连接到以太坊客户端
+func connectAndListen(ctx context.Context, chainName, rpcUrl, tokenContract string, mesonIndex uint8, tokenDecimal uint8, startBlockConfig uint64) error {
+	logrus.Infof("Connecting to RPC URL: %s", rpcUrl)
 	client, err := ethclient.Dial(rpcUrl)
 	if err != nil {
 		logrus.Errorf("Failed to connect to the Ethereum client: %v", err)
 		return fmt.Errorf("Failed to connect to the Ethereum client: %v", err)
 	}
-	defer client.Close() // 确保在函数结束时关闭客户端连接
+	defer client.Close()
 
-	// 解析合约的 ABI
 	parsedABI, err := abi.JSON(strings.NewReader(contractABI))
 	if err != nil {
 		logrus.Errorf("Failed to parse contract ABI: %v", err)
 		return fmt.Errorf("Failed to parse contract ABI: %v", err)
 	}
 
-	// 设置过滤器查询，指定要监听的合约地址
-	query := ethereum.FilterQuery{
-		Addresses: []common.Address{common.HexToAddress(tokenContract)},
-	}
-
-	logs := make(chan types.Log) // 创建一个通道用于接收日志
-	// 订阅过滤器日志
-	sub, err := client.SubscribeFilterLogs(ctx, query, logs)
+	contractAddress := common.HexToAddress(tokenContract)
+	startBlock, err := getLastBlockNumber(chainName, client, contractAddress, startBlockConfig)
 	if err != nil {
-		logrus.Errorf("Failed to subscribe to logs: %v", err)
-		return fmt.Errorf("Failed to subscribe to logs: %v", err)
+		logrus.Errorf("Failed to get last block number: %v", err)
+		return fmt.Errorf("Failed to get last block number: %v", err)
 	}
-	defer sub.Unsubscribe() // 确保在函数结束时取消订阅
 
 	for {
-		select {
-		case <-ctx.Done():
-			// 如果上下文被取消，返回错误
-			logrus.Warn("Context cancelled")
-			return fmt.Errorf("Context cancelled")
-		case err := <-sub.Err():
-			// 如果订阅过程中出现错误，返回错误
-			logrus.Errorf("Subscription error: %v", err)
-			return fmt.Errorf("Subscription error: %v", err)
-		case vLog := <-logs:
-			// 处理接收到的日志
-			// 打印交易哈希值
+		latestBlock, err := getLatestBlockNumber(client)
+		logrus.Infof("Chain name: %s, Latest block: %d", chainName, latestBlock)
+		if err != nil {
+			logrus.Errorf("Failed to get latest block number: %v", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		// 确保最新区块号大于上次检查的区块号100以上
+		if latestBlock <= startBlock+100 {
+			logrus.Infof("Latest block (%d) is not greater than start block (%d) by at least 100. Waiting...", latestBlock, startBlock)
+			time.Sleep(600 * time.Second)
+			continue
+		}
+
+		endBlock := startBlock + blockStep
+		if endBlock > latestBlock {
+			endBlock = latestBlock
+		}
+
+		query := ethereum.FilterQuery{
+			FromBlock: big.NewInt(int64(startBlock)),
+			ToBlock:   big.NewInt(int64(endBlock)),
+			Addresses: []common.Address{contractAddress},
+		}
+
+		logs, err := client.FilterLogs(ctx, query)
+		if err != nil {
+			logrus.Errorf("Failed to filter logs: %v", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		for _, vLog := range logs {
 			logrus.Infof("Transaction Hash: %s", vLog.TxHash.Hex())
 
-			// 根据事件的 topic[0] 进行匹配，处理不同的事件类型
 			switch vLog.Topics[0].Hex() {
 			case parsedABI.Events["TokenMintExecuted"].ID.Hex():
-				// 处理 TokenMintExecuted 事件
 				event := struct {
 					ReqID     common.Hash
 					Recipient common.Address
 				}{
-					ReqID:     vLog.Topics[1], // 从 Topics 中提取 reqId
-					Recipient: common.HexToAddress(vLog.Topics[2].Hex()), // 从 Topics 中提取 recipient
+					ReqID:     vLog.Topics[1],
+					Recipient: common.HexToAddress(vLog.Topics[2].Hex()),
 				}
 				processEvent(chainName, "TokenMintExecuted", event.ReqID, event.Recipient, vLog.TxHash, mesonIndex, tokenDecimal)
 
 			case parsedABI.Events["TokenBurnExecuted"].ID.Hex():
-				// 处理 TokenBurnExecuted 事件
 				event := struct {
 					ReqID    common.Hash
 					Proposer common.Address
 				}{
-					ReqID:    vLog.Topics[1], // 从 Topics 中提取 reqId
-					Proposer: common.HexToAddress(vLog.Topics[2].Hex()), // 从 Topics 中提取 proposer
+					ReqID:    vLog.Topics[1],
+					Proposer: common.HexToAddress(vLog.Topics[2].Hex()),
 				}
 				processEvent(chainName, "TokenBurnExecuted", event.ReqID, event.Proposer, vLog.TxHash, mesonIndex, tokenDecimal)
 			}
 		}
+
+		startBlock = endBlock + 1
+		err = saveLastBlockNumber(chainName, startBlock)
+		if err != nil {
+			logrus.Errorf("Failed to save last block number: %v", err)
+		}
+		time.Sleep(5 * time.Second) // 延迟一段时间后继续查询
 	}
 }
+
 
 
 // checkDatabase 定期检查数据库中 is_check 为 false 的 Meson 文档
@@ -361,29 +480,19 @@ func checkDatabase(wg *sync.WaitGroup, checkTime int) {
 			logrus.Info("Unchecked Mesons:")
 			for _, meson := range results {
 				// 构建消息字符串，包含 Meson 文档的详细信息
-				message := fmt.Sprintf(
-					"Error: \ncross-chain Time Out!\nReqID: %s\nChainA: %s\nChainB: %s\nTimestamp: %d\nAmountA: %f\nAmountB: %f\nActionA: %s\nActionB: %s\nTxHashA: %s\nTxHashB: %s\nIsCheck: %t\n",
-					meson.ReqID, meson.ChainA, meson.ChainB, meson.Timestamp, meson.AmountA, meson.AmountB, meson.ActionA, meson.ActionB, meson.TxHashA, meson.TxHashB, meson.IsCheck)
-				logrus.Info(message)
+				constructMessage(
+					meson.Timestamp,
+					meson.ChainA, meson.ActionA, meson.AmountA, meson.TxHashA,
+					meson.ChainB, meson.ActionB, meson.AmountB, meson.TxHashB,
+				)
+				//logrus.Info(message)
 
-				// 发送消息到 Telegram
-				err := telegramBot.SendMessage(message, "HTML")
-				if err != nil {
-					// 如果发送 Telegram 消息失败，输出错误信息
-					logrus.Errorf("Failed to send Telegram message: %v", err)
-				}
-
-				// 发送消息到 Lark
-				larkErr := larkBot.SendMessage(message)
-				if larkErr != nil {
-					// 如果发送 Lark 消息失败，输出错误信息
-					logrus.Errorf("Failed to send Lark message: %v", larkErr)
-				}
+				// 使用 sendNotification 函数统一发送消息
+				//sendNotification("Error", message)
 			}
 		}
 	}
 }
-
 
 // isMyToken 检查 tokenIndex 是否匹配已知的 token index
 // 该函数接受一个 *big.Int 类型的 reqId 和一个 uint8 类型的 myTokenIndex 作为参数
@@ -450,7 +559,6 @@ func InitLogger() {
 	logrus.SetLevel(logrus.InfoLevel)
 }
 
-
 func main() {
 
 	// 初始化日志记录器
@@ -478,7 +586,7 @@ func main() {
 
 	// 初始化 Telegram 和 Lark 机器人
 	// 使用配置文件中的参数创建 Telegram 和 Lark 机器人实例
-	telegramBot = bot.NewTelegramBot(config.Main.BotToken, config.Main.ChatID)
+	telegramBot = bot.NewTelegramBot(config.Main.BotToken, config.Main.ChatIDs)
 	larkBot = bot.NewLarkBot(config.Main.LarkBotURL)
 
 	// 使用 WaitGroup 来等待监听协程完成
@@ -495,11 +603,9 @@ func main() {
 		logrus.Infof("Starting listener for chain: %s", chainName)
 		wg.Add(1) // 增加 WaitGroup 计数
 		// 启动一个新的协程执行 listenEvents 函数
-		go listenEvents(&wg, chainName, chainConfig.RpcUrl, chainConfig.MesonContract, chainConfig.MesonIndex, chainConfig.TokenDecimal)
+		go listenEvents(&wg, chainName, chainConfig.RpcUrl, chainConfig.MesonContract, chainConfig.MesonIndex, chainConfig.TokenDecimal, chainConfig.StartBlock)
 	}
 
 	// 等待所有协程完成（实际上不会，因为协程中有无限循环）
 	wg.Wait()
 }
-
-

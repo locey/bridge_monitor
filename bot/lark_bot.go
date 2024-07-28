@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"fmt"
-
 	"github.com/sirupsen/logrus"
 )
 
@@ -21,44 +20,51 @@ func NewLarkBot(webhookURL string) *LarkBot {
 	}
 }
 
-// SendMessage 方法用于向飞书机器人发送消息。它接受一个 message 字符串参数，并返回一个错误类型的值。
-func (bot *LarkBot) SendMessage(message string) error {
-	// 创建一个包含消息内容的字典
+// SendMessage 方法用于向飞书机器人发送消息卡片。它接受 title 和内容参数，并返回一个错误类型的值。
+func (bot *LarkBot) SendMessage(title, time, from, to, txHashFrom, txHashTo string) error {
+	content := fmt.Sprintf("**Time:** %s\n\n**From:** %s\n**To:** %s\n\n**Tx hash (From):** %s\n**Tx hash (To):** %s\n",
+		time, from, to, txHashFrom, txHashTo)
+
 	data := map[string]interface{}{
-		"msg_type": "text", // 消息类型为文本
-		"content": map[string]string{
-			"text": message, // 消息内容
+		"msg_type": "interactive",
+		"card": map[string]interface{}{
+			"elements": []map[string]interface{}{
+				{
+					"tag": "div",
+					"text": map[string]interface{}{
+						"content": content,
+						"tag":     "lark_md",
+					},
+				},
+			},
+			"header": map[string]interface{}{
+				"title": map[string]interface{}{
+					"content": title,
+					"tag":     "plain_text",
+				},
+			},
 		},
 	}
 
-	// 将字典编码为 JSON 格式
 	body, err := json.Marshal(data)
 	if err != nil {
-		// 如果 JSON 编码失败，使用 logrus 记录错误并返回一个格式化的错误
 		logrus.Errorf("Failed to marshal JSON: %v", err)
 		return err
 	}
 
-	// 使用 http.Post 方法发送 POST 请求，内容类型为 "application/json"
 	resp, err := http.Post(bot.WebhookURL, "application/json", bytes.NewBuffer(body))
 	if err != nil {
-		// 如果发送请求失败，使用 logrus 记录错误并返回一个格式化的错误
 		logrus.Errorf("Failed to send message: %v", err)
 		return err
 	}
-	defer resp.Body.Close() // 确保响应体在函数退出时关闭
+	defer resp.Body.Close()
 
-	// 检查响应状态码是否为 200 OK
 	if resp.StatusCode != http.StatusOK {
-		// 如果状态码不是 200，使用 logrus 记录错误并返回一个格式化的错误
 		err := fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 		logrus.Error(err)
 		return err
 	}
 
-	// 使用 logrus 记录成功发送消息的信息
-	logrus.Infof("Message sent successfully: %s", message)
-
-	// 如果没有错误，返回 nil
+	logrus.Infof("Message sent successfully: %s", title)
 	return nil
 }
